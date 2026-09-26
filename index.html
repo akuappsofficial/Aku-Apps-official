@@ -1,10 +1,81 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>My Site</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>M. A. Akmal Ahamed | Portfolio</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <h1>Hello World!</h1>
-    <p>My site is alive by akmal!</p>
+
+  <header>
+    <nav>
+      <div class="logo">AKMAL // DEV</div>
+      <ul>
+        <li><a href="index.html" class="active">Home</a></li>
+        <li><a href="projects.html">Projects</a></li>
+        <li><a href="contact.html">Contact</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <span class="badge">10T 2026 • St. Sylvester’s College</span>
+      <h1>M. A. Akmal Ahamed</h1>
+      
+      <!-- Typing Animation Container -->
+      <div class="typing-container">
+        I build <span id="typewriter"></span><span class="cursor">|</span>
+      </div>
+
+      <p>I don't just write code; I build fully-realized digital ecosystems. From conceptualizing modern UI/UX to deploying full-stack web applications on Base44.</p>
+      <a href="projects.html" class="btn">Explore My Universe</a>
+    </section>
+
+    <section style="margin-top: 4rem;">
+      <div class="grid">
+        <div class="card">
+          <h3>UI/UX & Frontend</h3>
+          <p>Crafting immersive, colorful, and fully animated web experiences using HTML, CSS, JavaScript, and modern design principles.</p>
+        </div>
+        <div class="card">
+          <h3>System Architecture</h3>
+          <p>Structuring scalable ecosystems and managing continuous deployments using GitHub and the Base44 infrastructure.</p>
+        </div>
+        <div class="card">
+          <h3>Creative Development</h3>
+          <p>Blending graphic design, visual asset creation, and coding to produce applications that look as good as they function.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>© 2026 M. A. Akmal Ahamed • ICT Society</p>
+  </footer>
+
+  <!-- Typing Effect Script -->
+  <script>
+    const words = ["Web Applications.", "Digital Ecosystems.", "Base44 Solutions.", "Creative UIs."];
+    let i = 0, j = 0;
+    let isDeleting = false;
+    let text = "";
+    
+    function type() {
+      text = words[i];
+      if (isDeleting) {
+        document.getElementById("typewriter").textContent = text.substring(0, j - 1);
+        j--;
+        if (j == 0) { isDeleting = false; i++; if (i == words.length) i = 0; }
+      } else {
+        document.getElementById("typewriter").textContent = text.substring(0, j + 1);
+        j++;
+        if (j == text.length) { isDeleting = true; setTimeout(type, 1500); return; }
+      }
+      setTimeout(type, isDeleting ? 50 : 100);
+    }
+    type();
+  </script>
 </body>
 </html>
