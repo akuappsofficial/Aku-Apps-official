@@ -149,3 +149,51 @@ main { max-width: 1200px; margin: 0 auto; padding: 4rem 2rem; flex: 1; }
 }
 
 footer { text-align: center; padding: 2rem; color: var(--text-sub); border-top: 1px solid var(--glass-border); } 
+/* =========================================
+   Mobile Responsiveness & Media Queries
+   ========================================= */
+
+@media (max-width: 768px) {
+  /* Stack the navigation and center it */
+  nav {
+    flex-direction: column;
+    gap: 1rem;
+    padding: 1rem;
+  }
+  
+  nav ul {
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  /* Scale down the massive hero text */
+  .hero h1 {
+    font-size: 2.5rem;
+  }
+
+  .typing-container {
+    font-size: 1.2rem;
+  }
+
+  /* Reduce main padding for more screen space */
+  main {
+    padding: 2rem 1rem;
+  }
+
+  /* Force the grid into a single column so cards don't overflow */
+  .grid {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+
+  /* Slightly tighter padding inside the glass cards */
+  .card {
+    padding: 1.5rem;
+  }
+  
+  /* Scale down sub-page headers */
+  h1 {
+    font-size: 2.2rem !important;
+  }
+}
