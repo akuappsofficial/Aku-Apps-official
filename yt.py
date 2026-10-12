@@ -1,161 +1,362 @@
 #!/usr/bin/env python3
-"""AKU Video Download - YT & Universal. CLI + LAN dashboard."""
-import os, sys, time, threading, socket, tempfile, shutil, html, re
-from urllib.parse import parse_qs, urlparse, quote
+"""AKU Video Downloader: local desktop/mobile UI, Test Mode, and yt-dlp jobs."""
+import json, mimetypes, os, platform, re, shutil, socket, sys, threading, time, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import quote, urlparse
 
 try:
     import yt_dlp
 except ImportError:
-    print("Missing dependency: yt-dlp. Run: python -m pip install -r requirements.txt")
-    raise SystemExit(1)
+    raise SystemExit("Missing yt-dlp. Run: python -m pip install -r requirements.txt")
 
+ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 PORT = int(os.environ.get("AKU_PORT", "8080"))
-MAX_JOBS = threading.BoundedSemaphore(2)
-JOBS_LOCK = threading.Lock()
-JOBS = set()
+MAX_JOBS, MAX_BODY, MAX_FILE = 2, 65536, 2 * 1024**3
+MIN_FREE = 256 * 1024**2
+LOCK = threading.RLock()
+JOBS = {}
+ACTIVE = 0
+
+
+def asset(*parts):
+    return ROOT.joinpath(*parts)
+
+
+def download_dir():
+    home = Path.home()
+    for p in (home/"storage/shared/Download/AKU-Video-Downloads",
+              home/"Downloads/AKU-Video-Downloads", home/"AKU-Video-Downloads"):
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            test = p/".write-test"
+            test.write_text("ok", encoding="utf-8")
+            test.unlink()
+            return p
+        except OSError:
+            pass
+    raise OSError("No writable download folder found.")
+
+
+DEST = download_dir()
+
+
+def normalize_url(value):
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError("Enter a URL or YouTube video ID.")
+    if len(value) > 4096:
+        raise ValueError("URL is too long (4096 characters maximum).")
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+        value = "https://www.youtube.com/watch?v=" + value
+    elif "://" not in value:
+        value = "https://" + value
+    p = urlparse(value)
+    if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password:
+        raise ValueError("Enter a valid http/https URL without embedded credentials.")
+    return value
+
+
+def fmt_bytes(n):
+    if n is None:
+        return "Unknown"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def fmt_duration(n):
+    if n is None:
+        return "Unknown"
+    try:
+        n = max(0, int(n))
+    except (TypeError, ValueError):
+        return "Unknown"
+    h, rest = divmod(n, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+def estimate(info, max_height=None, audio=False):
+    best, duration = 0, info.get("duration") or 0
+    for f in info.get("formats", []):
+        vc, ac, h = f.get("vcodec"), f.get("acodec"), f.get("height")
+        if audio:
+            if ac in (None, "none") or vc not in (None, "none"):
+                continue
+        else:
+            if vc in (None, "none") or (max_height is not None and h is not None and h > max_height):
+                continue
+        size = f.get("filesize") or f.get("filesize_approx")
+        rate = f.get("abr" if audio else "tbr")
+        if not size and rate and duration:
+            size = int(float(rate) * 1000 / 8 * duration)
+        best = max(best, int(size or 0))
+    return best or None
+
+
+def format_for(q):
+    choices = {
+        "best": ("bestvideo*+bestaudio/best", False),
+        "1080p": ("bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", False),
+        "720p": ("bestvideo[height<=720]+bestaudio/best[height<=720]/best", False),
+        "480p": ("bestvideo[height<=480]+bestaudio/best[height<=480]/best", False),
+        "360p": ("bestvideo[height<=360]+bestaudio/best[height<=360]/best", False),
+        "audio": ("bestaudio/best", False),
+        "mp3": ("bestaudio/best", True),
+    }
+    if q not in choices:
+        raise ValueError("Unsupported quality selection.")
+    return choices[q]
+
+
+def analyze(url):
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 20, "retries": 2}) as ydl:
+        info = ydl.extract_info(normalize_url(url), download=False)
+    if not info:
+        raise RuntimeError("No media information was returned.")
+    return {
+        "id": str(info.get("id") or ""), "title": str(info.get("title") or "Untitled"),
+        "site": str(info.get("extractor_key") or info.get("extractor") or "Media"),
+        "duration": fmt_duration(info.get("duration")), "uploader": str(info.get("uploader") or ""),
+        "thumbnail": str(info.get("thumbnail") or ""), "filesize": fmt_bytes(estimate(info)),
+        "filesize_720p": fmt_bytes(estimate(info, 720)),
+        "formats": sorted({int(f["height"]) for f in info.get("formats", []) if f.get("height")}, reverse=True)[:12],
+    }
+
+
+def diagnostics(url=None):
+    checks = [
+        {"name": "Python", "ok": sys.version_info >= (3, 9), "detail": platform.python_version()},
+        {"name": "yt-dlp", "ok": True, "detail": getattr(getattr(yt_dlp, "version", None), "__version__", "installed")},
+    ]
+    ffmpeg = shutil.which("ffmpeg")
+    checks.append({"name": "FFmpeg", "ok": bool(ffmpeg), "detail": ffmpeg or "Not found; required for MP3 conversion"})
+    try:
+        free = shutil.disk_usage(DEST).free
+        probe = DEST/".diagnostic"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks.append({"name": "Storage", "ok": free >= MIN_FREE, "detail": str(DEST) + " · " + fmt_bytes(free) + " free"})
+    except OSError as e:
+        checks.append({"name": "Storage", "ok": False, "detail": str(e)})
+    try:
+        with socket.create_connection(("1.1.1.1", 443), timeout=3):
+            pass
+        checks.append({"name": "Internet", "ok": True, "detail": "Connection succeeded"})
+    except OSError:
+        checks.append({"name": "Internet", "ok": False, "detail": "Connection test failed; check network/firewall"})
+    result = {"checks": checks, "download_dir": str(DEST), "active_jobs": ACTIVE}
+    if url:
+        try:
+            result["video"], result["url_ok"] = analyze(url), True
+        except Exception as e:
+            result["url_ok"], result["url_error"] = False, str(e)[:500]
+    return result
+
+
+def run_job(job_id, url, quality):
+    global ACTIVE
+    folder = DEST/".jobs"/job_id
+    try:
+        if shutil.disk_usage(DEST).free < MIN_FREE:
+            raise OSError("Less than 256 MB of free storage is available.")
+        folder.mkdir(parents=True, exist_ok=True)
+        fmt, mp3 = format_for(quality)
+        if mp3 and not shutil.which("ffmpeg"):
+            raise RuntimeError("FFmpeg is required for MP3 conversion. Install FFmpeg and retry.")
+        def hook(d):
+            with LOCK:
+                job = JOBS.get(job_id)
+                if not job:
+                    return
+                if d.get("status") == "downloading":
+                    got = d.get("downloaded_bytes") or 0
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                    job.update(status="downloading", downloaded=got, total=total,
+                               percent=round(min(100, got*100/total), 1) if total else None,
+                               speed=d.get("_speed_str") or "", eta=d.get("_eta_str") or "")
+                elif d.get("status") == "finished":
+                    job.update(status="processing", percent=100, message="Finalizing media…")
+        opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "format": fmt,
+                "outtmpl": str(folder/"%(title).160B [%(id)s].%(ext)s"), "progress_hooks": [hook],
+                "retries": 5, "fragment_retries": 5, "socket_timeout": 30, "continuedl": True,
+                "overwrites": False, "max_filesize": MAX_FILE, "concurrent_fragment_downloads": 1}
+        if mp3:
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        candidates = [p for p in folder.iterdir() if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
+        if not candidates:
+            raise RuntimeError("Download finished without producing a file.")
+        source = max(candidates, key=lambda p: p.stat().st_mtime)
+        if source.stat().st_size > MAX_FILE:
+            raise RuntimeError("Downloaded file exceeds the 2 GB safety limit.")
+        target = DEST/source.name
+        if target.exists():
+            target = DEST/(source.stem+"-"+job_id[:6]+source.suffix)
+        shutil.move(str(source), str(target))
+        with LOCK:
+            JOBS[job_id].update(status="completed", percent=100, title=str(info.get("title") or target.name),
+                                filename=target.name, size=target.stat().st_size, message="Download complete.")
+    except Exception as e:
+        with LOCK:
+            JOBS[job_id].update(status="error", error=str(e)[:700], message="Download failed.")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+        with LOCK:
+            ACTIVE = max(0, ACTIVE-1)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "AKUVideo/2.1"
+    def log_message(self, fmt, *args):
+        print("[AKU] " + (fmt % args))
+    def send_data(self, data, mime="application/json; charset=utf-8", status=200, headers=None):
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    def send_json(self, data, status=200):
+        self.send_data(json.dumps(data, ensure_ascii=False).encode("utf-8"), status=status)
+    def read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            if n <= 0 or n > MAX_BODY:
+                raise ValueError("Request is empty or exceeds 64 KiB.")
+            data = json.loads(self.rfile.read(n).decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Request JSON must be an object.")
+            return data
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ValueError("Invalid request body: " + str(e)) from e
+    def serve_file(self, path):
+        path = path.resolve()
+        roots = [asset("templates").resolve(), asset("static").resolve(), asset("mobile").resolve()]
+        if not any(p == path or p in path.parents for p in roots) or not path.is_file():
+            return self.send_json({"error": "Not found"}, 404)
+        mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        self.send_data(path.read_bytes(), mime + ("; charset=utf-8" if mime.startswith(("text/", "application/javascript")) else ""))
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            return self.serve_file(asset("templates", "index.html"))
+        if path in ("/mobile", "/mobile/"):
+            return self.serve_file(asset("mobile", "index.html"))
+        if path.startswith("/static/"):
+            return self.serve_file(asset("static", path[len("/static/"):]))
+        if path.startswith("/mobile/"):
+            return self.serve_file(asset("mobile", path[len("/mobile/"):]))
+        if path == "/api/health":
+            return self.send_json({"ok": True, "active_jobs": ACTIVE, "download_dir": str(DEST)})
+        if path.startswith("/api/jobs/"):
+            bits = path.strip("/").split("/")
+            jid = bits[2] if len(bits) > 2 else ""
+            with LOCK:
+                job = JOBS.get(jid)
+                if not job:
+                    return self.send_json({"error": "Job not found"}, 404)
+                snapshot = dict(job)
+            if len(bits) > 3 and bits[3] == "file":
+                if snapshot.get("status") != "completed":
+                    return self.send_json({"error": "File is not ready."}, 409)
+                file = DEST/snapshot.get("filename", "")
+                if not file.is_file() or file.parent != DEST:
+                    return self.send_json({"error": "File is no longer available."}, 404)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(file.stat().st_size))
+                self.send_header("Content-Disposition", "attachment; filename*=UTF-8''"+quote(file.name))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                try:
+                    with file.open("rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            return self.send_json({k:v for k,v in snapshot.items() if k != "file_path"})
+        return self.send_json({"error": "Not found"}, 404)
+    def do_POST(self):
+        global ACTIVE
+        path = self.path.split("?", 1)[0]
+        try:
+            data = self.read_json()
+            if path == "/api/info":
+                return self.send_json({"ok": True, "video": analyze(data.get("url"))})
+            if path == "/api/test":
+                return self.send_json(diagnostics(normalize_url(data["url"]) if data.get("url") else None))
+            if path == "/api/download":
+                url, quality = normalize_url(data.get("url")), str(data.get("quality") or "best")
+                format_for(quality)
+                if shutil.disk_usage(DEST).free < MIN_FREE:
+                    return self.send_json({"error": "Less than 256 MB free storage remains."}, 507)
+                with LOCK:
+                    if ACTIVE >= MAX_JOBS:
+                        return self.send_json({"error": "Two downloads are already running. Try again shortly."}, 429)
+                    jid = uuid.uuid4().hex[:12]
+                    ACTIVE += 1
+                    JOBS[jid] = {"id":jid,"status":"queued","percent":0,"downloaded":0,"total":None,"speed":"","eta":"","quality":quality,"created":time.time()}
+                threading.Thread(target=run_job, args=(jid,url,quality), daemon=True).start()
+                return self.send_json({"ok":True,"job_id":jid}, 202)
+            return self.send_json({"error":"Not found"}, 404)
+        except (ValueError, KeyError) as e:
+            return self.send_json({"error":str(e)}, 400)
+        except Exception as e:
+            return self.send_json({"error":str(e)[:700]}, 500)
+
 
 def local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80)); return s.getsockname()[0]
-    except OSError: return "127.0.0.1"
-    finally: s.close()
+        s.connect(("1.1.1.1", 443))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
-def fmt_bytes(n):
-    if n is None: return "Unknown"
-    n = float(n)
-    for unit in ("B","KB","MB","GB","TB"):
-        if n < 1024: return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} PB"
 
-def estimate(info, max_height=None):
-    duration = info.get("duration") or 0
-    best = 0
-    for f in info.get("formats", []):
-        if f.get("vcodec") in (None, "none"): continue
-        h = f.get("height")
-        if max_height and h and h > max_height: continue
-        size = f.get("filesize") or f.get("filesize_approx")
-        if not size and f.get("tbr") and duration:
-            size = int(f["tbr"] * 1000 / 8 * duration)
-        best = max(best, size or 0)
-    return best or None
-
-def expand_url(url):
-    p = urlparse(url)
-    if p.scheme not in ("http", "https") or not p.hostname: raise ValueError("Enter a valid http/https URL.")
-    import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=8) as r: return r.geturl()
-    except Exception: return url
-
-def analyze(url):
-    opts = {"quiet":True, "no_warnings":True, "noplaylist":True}
-    with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(expand_url(url), download=False)
-
-def page(body):
-    return ("<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>AKU Video Download</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#080d18;color:#edf5ff;font:16px system-ui;display:grid;place-items:center;padding:20px}"
-    ".card{width:min(100%,600px);padding:28px;border:1px solid #26344c;border-radius:22px;background:linear-gradient(145deg,#131e32,#0b1220);box-shadow:0 20px 80px #0008}h1{color:#38bdf8;margin:0}p{color:#9aacc4}input,select,button{width:100%;padding:14px;margin-top:12px;border-radius:10px;border:1px solid #33445e;background:#080f1d;color:#fff;font:inherit}button{background:#38bdf8;color:#03111b;font-weight:700;cursor:pointer;border:0}a{color:#38bdf8}small{color:#9aacc4}</style><main class='card'><h1>AKU Video Download</h1><p>YouTube & supported media sites · LAN dashboard</p>"+body+"</main></html>")
-
-class AKUWebHandler(BaseHTTPRequestHandler):
-    server_version = "AKUVideo/1.0"
-    def send_html(self, body, status=200):
-        data = page(body).encode()
-        self.send_response(status); self.send_header("Content-Type","text/html; charset=utf-8")
-        self.send_header("Content-Length",str(len(data))); self.end_headers()
-        try: self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError): pass
-    def do_GET(self):
-        if self.path != "/":
-            self.send_html("<h2>Not found</h2><a href='/'>Home</a>",404); return
-        self.send_html("<form method='post' action='/preview'><label>Media URL</label><input name='url' type='url' maxlength='4096' placeholder='https://…' required><button>Analyze link</button></form><small>Use only content you are authorized to download. Two concurrent jobs maximum.</small>")
-    def do_POST(self):
-        if self.path not in ("/preview","/download"):
-            self.send_html("<h2>Not found</h2>",404); return
-        try:
-            length = int(self.headers.get("Content-Length","0"))
-            if length <= 0 or length > 8192: raise ValueError("Invalid request size.")
-            params = parse_qs(self.rfile.read(length).decode("utf-8","replace"), max_num_fields=10)
-            url = params.get("url",[""])[0].strip()
-            if len(url)>4096: raise ValueError("URL too long.")
-            url = expand_url(url)
-            if self.path == "/preview":
-                info = analyze(url)
-                title = html.escape(info.get("title") or "Untitled")
-                best = fmt_bytes(estimate(info))
-                hd = fmt_bytes(estimate(info,720))
-                body = f"<h2>{title}</h2><p>{html.escape(info.get('extractor_key','Media'))} · {int(info.get('duration') or 0)} sec</p><p>Estimated best video: {best}<br>Estimated up to 720p: {hd}</p><form method='post' action='/download'><input type='hidden' name='url' value='{html.escape(url,quote=True)}'><select name='quality'><option value='best'>Best available</option><option value='720p'>Up to 720p</option><option value='audio'>Audio only (source format)</option></select><button>Download to this device</button></form><p><a href='/'>Analyze another link</a></p>"
-                self.send_html(body)
-            else:
-                if not MAX_JOBS.acquire(blocking=False):
-                    self.send_html("<h2>Server busy</h2><p>Two downloads are already running. Try again shortly.</p><a href='/'>Back</a>",429); return
-                tmp = tempfile.mkdtemp(prefix="aku-job-")
-                with JOBS_LOCK: JOBS.add(tmp)
-                try:
-                    quality = params.get("quality",["best"])[0]
-                    fmt = {"720p":"best[height<=720]/bestvideo[height<=720]+bestaudio/best","audio":"bestaudio/best"}.get(quality,"bestvideo+bestaudio/best")
-                    opts = {"quiet":True,"no_warnings":True,"noplaylist":True,"format":fmt,"outtmpl":os.path.join(tmp,"%(title).120B [%(id)s].%(ext)s"),"max_filesize":2*1024**3}
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url,download=True)
-                        filename = ydl.prepare_filename(info)
-                    if not os.path.isfile(filename):
-                        stem = os.path.splitext(filename)[0]
-                        candidates = [os.path.join(tmp,n) for n in os.listdir(tmp) if n.startswith(os.path.basename(stem))]
-                        if not candidates: raise RuntimeError("Downloaded file could not be located.")
-                        filename = candidates[0]
-                    size = os.path.getsize(filename)
-                    name = os.path.basename(filename).replace("\r","").replace("\n","")
-                    self.send_response(200); self.send_header("Content-Type","application/octet-stream")
-                    self.send_header("Content-Disposition", "attachment; filename*=UTF-8''"+quote(name))
-                    self.send_header("Content-Length",str(size)); self.end_headers()
-                    with open(filename,"rb") as f:
-                        while True:
-                            chunk=f.read(64*1024)
-                            if not chunk: break
-                            self.wfile.write(chunk)
-                finally:
-                    shutil.rmtree(tmp,ignore_errors=True)
-                    with JOBS_LOCK: JOBS.discard(tmp)
-                    MAX_JOBS.release()
-        except (BrokenPipeError, ConnectionResetError): pass
-        except Exception as e: self.send_html("<h2>Request failed</h2><p>"+html.escape(str(e)[:500])+"</p><a href='/'>Try again</a>",400)
-    def log_message(self, fmt, *args): print(f"[LAN] {self.client_address[0]} {fmt % args}")
-
-def run_server():
-    server = ThreadingHTTPServer(("0.0.0.0",PORT),AKUWebHandler)
+def main():
+    global PORT
+    mobile = "--mobile" in sys.argv
+    open_browser = "--no-browser" not in sys.argv and platform.system() != "Android"
+    for arg in sys.argv[1:]:
+        if arg.startswith("--port="):
+            PORT = int(arg.split("=",1)[1])
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
-    print(f"AKU Video Download server running on http://{local_ip()}:{PORT}")
-    print("Same Wi-Fi/hotspot devices can open the URL above. Ctrl+C to stop.")
-    try: server.serve_forever()
-    except KeyboardInterrupt: pass
-    finally: server.server_close()
+    print("\nAKU VIDEO DOWNLOADER 2.1")
+    print("Desktop UI : http://127.0.0.1:%s/" % PORT)
+    print("Mobile UI  : http://127.0.0.1:%s/mobile" % PORT)
+    print("LAN mobile : http://%s:%s/mobile" % (local_ip(), PORT))
+    print("Downloads  : " + str(DEST))
+    print("Test Mode is available in both interfaces. Ctrl+C stops the server.\n")
+    if open_browser:
+        url = "http://127.0.0.1:%s%s" % (PORT, "/mobile" if mobile else "/")
+        threading.Timer(1, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping AKU Video Downloader…")
+    finally:
+        server.server_close()
 
-def run_cli():
-    dest=os.path.join(os.path.expanduser("~"),"Downloads","yt-downloads")
-    os.makedirs(dest,exist_ok=True)
-    print("AKU Video Download - YT & Universal")
-    print(f"Web dashboard: http://{local_ip()}:{PORT} (starts with CLI)")
-    server=threading.Thread(target=run_server,daemon=True); server.start()
-    while True:
-        try: url=input("\nURL / 11-character YouTube ID (exit to quit): ").strip()
-        except (EOFError,KeyboardInterrupt): break
-        if url.lower() in ("exit","quit","q"): break
-        if not url: continue
-        if re.fullmatch(r"[A-Za-z0-9_-]{11}",url): url="https://www.youtube.com/watch?v="+url
-        try:
-            print("Analyzing…"); info=analyze(url)
-            print(f"{info.get('title','Untitled')} · {int(info.get('duration') or 0)} sec · est. {fmt_bytes(estimate(info))}")
-            q=input("[1] Best video [2] Up to 720p [3] Audio source (default 1): ").strip()
-            fmt={"2":"best[height<=720]/bestvideo[height<=720]+bestaudio/best","3":"bestaudio/best"}.get(q,"bestvideo+bestaudio/best")
-            opts={"format":fmt,"outtmpl":os.path.join(dest,"%(title).120B [%(id)s].%(ext)s"),"noplaylist":True}
-            with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([expand_url(url)])
-            print("Download complete:",dest)
-        except Exception as e: print("Error:",e)
-    print("Goodbye.")
 
-if __name__=="__main__":
-    run_server() if "--server" in sys.argv else run_cli()
+if __name__ == "__main__":
+    main()

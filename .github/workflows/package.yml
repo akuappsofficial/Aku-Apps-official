@@ -1,29 +1,46 @@
-name: Build AKU Video Downloader ZIP
+name: Test and Build AKU Video Downloader
 on:
-  workflow_dispatch:
   push:
     branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
-  actions: write
 jobs:
-  package:
+  test:
+    name: Python syntax and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m compileall -q yt.py tests
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+  package-windows:
+    name: Build Windows ZIP and executable
+    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
       - name: Install dependencies
         run: python -m pip install -r requirements.txt pyinstaller
-      - name: Build Windows executable
-        run: python -m PyInstaller --noconfirm --clean --onefile --console --name "AKU Video Downloader" --collect-all yt_dlp yt.py
-      - name: Assemble package
+      - name: Build executable with UI assets
+        run: python -m PyInstaller --noconfirm --clean --onefile --console --name "AKU Video Downloader" --collect-all yt_dlp --add-data "templates;templates" --add-data "static;static" --add-data "mobile;mobile" yt.py
+      - name: Assemble Windows package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force package | Out-Null
-          Copy-Item yt.py,requirements.txt,START.bat,START_WEB_SERVER.bat,BUILD_EXE.bat,README.md package/
+          Copy-Item README.md,requirements.txt,START.bat,START_WEB_SERVER.bat,START_MOBILE.bat,BUILD_EXE.bat package/
           Copy-Item "dist/AKU Video Downloader.exe" package/
+          Copy-Item -Path templates,static,mobile -Destination package -Recurse
           Compress-Archive -Path package/* -DestinationPath AKU_Video_Download_Windows.zip -Force
       - uses: actions/upload-artifact@v4
         with:
